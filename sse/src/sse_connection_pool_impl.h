@@ -1,23 +1,16 @@
-#ifndef EXTENSION_SSE_POSIX_IMPL_H
-#define EXTENSION_SSE_POSIX_IMPL_H
+#ifndef EXTENSION_SSE_CONNECTION_POOL_IMPL_H
+#define EXTENSION_SSE_CONNECTION_POOL_IMPL_H
+
+#include <dmsdk/dlib/connection_pool.h>
+#include <dmsdk/dlib/socket.h>
+#include <dmsdk/dlib/sslsocket.h>
 
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <limits.h>
-#include <netdb.h>
-#include <poll.h>
-#include <stddef.h>
-#include <stdio.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include <stdlib.h>
 
-#ifndef MSG_NOSIGNAL
-#define MSG_NOSIGNAL 0
-#endif
+#define SSE_DM_CONNECT_TIMEOUT_US (15000000)
+#define SSE_DM_SOCKET_WAIT_US (100000)
 
 struct SSEDesktopConnection
 {
@@ -28,12 +21,16 @@ struct SSEDesktopConnection
     SSEParser m_Parser;
     dmThread::Thread m_Thread;
     dmMutex::HMutex m_Mutex;
-    int m_Socket;
+    dmConnectionPool::HConnection m_Connection;
+    dmSocket::Socket m_Socket;
+    dmSSLSocket::Socket m_SSLSocket;
     int32_t m_RetryMS;
     int32_t m_Status;
+    int m_CancelFlag;
     uint8_t m_Reconnect;
     uint8_t m_Stop;
     uint8_t m_Opened;
+    uint8_t m_Secure;
 
     SSEDesktopConnection()
     : m_Handle(0)
@@ -41,25 +38,36 @@ struct SSEDesktopConnection
     , m_LastEventId(0)
     , m_Thread(0)
     , m_Mutex(0)
-    , m_Socket(-1)
+    , m_Connection(0)
+    , m_Socket(0)
+    , m_SSLSocket(0)
     , m_RetryMS(3000)
     , m_Status(0)
+    , m_CancelFlag(0)
     , m_Reconnect(0)
     , m_Stop(0)
     , m_Opened(0)
+    , m_Secure(0)
     {
     }
 };
 
-struct SSEPOSIXUrl
+struct SSEDMUrl
 {
     std::string m_Host;
-    std::string m_Port;
     std::string m_Path;
     std::string m_HostHeader;
+    int m_Port;
+    uint8_t m_Secure;
+
+    SSEDMUrl()
+    : m_Port(0)
+    , m_Secure(0)
+    {
+    }
 };
 
-struct SSEPOSIXChunkDecoder
+struct SSEDMChunkDecoder
 {
     enum State
     {
@@ -74,12 +82,14 @@ struct SSEPOSIXChunkDecoder
     size_t m_Remaining;
     State m_State;
 
-    SSEPOSIXChunkDecoder()
+    SSEDMChunkDecoder()
     : m_Remaining(0)
     , m_State(STATE_SIZE)
     {
     }
 };
+
+static dmConnectionPool::HPool g_SSEConnectionPool = 0;
 
 static char* SSEDesktop_StrDup(const char* value)
 {
@@ -108,47 +118,32 @@ static bool SSEDesktop_ShouldStop(SSEDesktopConnection* connection)
     return connection->m_Stop != 0;
 }
 
-static void SSEPOSIX_SetSocket(SSEDesktopConnection* connection, int socket_fd)
+static void SSEDM_SetConnection(SSEDesktopConnection* connection, dmConnectionPool::HConnection pool_connection)
 {
     DM_MUTEX_SCOPED_LOCK(connection->m_Mutex);
-    connection->m_Socket = socket_fd;
+    connection->m_Connection = pool_connection;
 }
 
-static int SSEPOSIX_TakeSocket(SSEDesktopConnection* connection)
+static dmConnectionPool::HConnection SSEDM_TakeConnection(SSEDesktopConnection* connection)
 {
     DM_MUTEX_SCOPED_LOCK(connection->m_Mutex);
-    const int socket_fd = connection->m_Socket;
-    connection->m_Socket = -1;
-    return socket_fd;
+    dmConnectionPool::HConnection pool_connection = connection->m_Connection;
+    connection->m_Connection = 0;
+    connection->m_Socket = 0;
+    connection->m_SSLSocket = 0;
+    return pool_connection;
 }
 
-static int SSEPOSIX_GetSocket(SSEDesktopConnection* connection)
+static void SSEDM_CloseActiveConnection(SSEDesktopConnection* connection)
 {
-    DM_MUTEX_SCOPED_LOCK(connection->m_Mutex);
-    return connection->m_Socket;
-}
-
-static void SSEPOSIX_CloseSocketFd(int socket_fd)
-{
-    if (socket_fd >= 0)
+    dmConnectionPool::HConnection pool_connection = SSEDM_TakeConnection(connection);
+    if (pool_connection && g_SSEConnectionPool)
     {
-        shutdown(socket_fd, SHUT_RDWR);
-        close(socket_fd);
+        dmConnectionPool::Close(g_SSEConnectionPool, pool_connection);
     }
 }
 
-static void SSEPOSIX_CloseActiveSocket(SSEDesktopConnection* connection)
-{
-    const int socket_fd = SSEPOSIX_TakeSocket(connection);
-    SSEPOSIX_CloseSocketFd(socket_fd);
-}
-
-static bool SSEPOSIX_IsDefaultPort(const std::string& port)
-{
-    return port == "80";
-}
-
-static bool SSEPOSIX_HasControlChars(const char* value)
+static bool SSEDM_HasControlChars(const char* value)
 {
     if (!value)
     {
@@ -166,7 +161,7 @@ static bool SSEPOSIX_HasControlChars(const char* value)
     return false;
 }
 
-static std::string SSEPOSIX_LowerASCII(const std::string& value)
+static std::string SSEDM_LowerASCII(const std::string& value)
 {
     std::string result;
     result.reserve(value.size());
@@ -179,7 +174,31 @@ static std::string SSEPOSIX_LowerASCII(const std::string& value)
     return result;
 }
 
-static bool SSEPOSIX_ParseUrl(const char* url, SSEPOSIXUrl* output, char* error, uint32_t error_size)
+static bool SSEDM_IsDefaultPort(const SSEDMUrl* url)
+{
+    return (!url->m_Secure && url->m_Port == 80) || (url->m_Secure && url->m_Port == 443);
+}
+
+static bool SSEDM_ParsePort(const std::string& port, int* out_port)
+{
+    if (port.empty())
+    {
+        return false;
+    }
+
+    char* end = 0;
+    errno = 0;
+    const long parsed = strtol(port.c_str(), &end, 10);
+    if (errno != 0 || !end || *end != 0 || parsed <= 0 || parsed > 65535)
+    {
+        return false;
+    }
+
+    *out_port = (int)parsed;
+    return true;
+}
+
+static bool SSEDM_ParseUrl(const char* url, SSEDMUrl* output, char* error, uint32_t error_size)
 {
     if (!url || !url[0])
     {
@@ -191,14 +210,24 @@ static bool SSEPOSIX_ParseUrl(const char* url, SSEPOSIXUrl* output, char* error,
     const size_t scheme_end = value.find("://");
     if (scheme_end == std::string::npos)
     {
-        dmSnPrintf(error, error_size, "SSE URL must include http://");
+        dmSnPrintf(error, error_size, "SSE URL must include http:// or https://");
         return false;
     }
 
-    const std::string scheme = SSEPOSIX_LowerASCII(value.substr(0, scheme_end));
-    if (scheme != "http")
+    const std::string scheme = SSEDM_LowerASCII(value.substr(0, scheme_end));
+    if (scheme == "http")
     {
-        dmSnPrintf(error, error_size, "Linux SSE backend currently supports http:// URLs only");
+        output->m_Secure = 0;
+        output->m_Port = 80;
+    }
+    else if (scheme == "https")
+    {
+        output->m_Secure = 1;
+        output->m_Port = 443;
+    }
+    else
+    {
+        dmSnPrintf(error, error_size, "SSE URL must use http or https");
         return false;
     }
 
@@ -232,7 +261,6 @@ static bool SSEPOSIX_ParseUrl(const char* url, SSEPOSIXUrl* output, char* error,
         return false;
     }
 
-    output->m_Port = "80";
     if (authority[0] == '[')
     {
         const size_t end = authority.find(']');
@@ -250,7 +278,11 @@ static bool SSEPOSIX_ParseUrl(const char* url, SSEPOSIXUrl* output, char* error,
                 dmSnPrintf(error, error_size, "SSE URL host is invalid");
                 return false;
             }
-            output->m_Port = authority.substr(end + 2);
+            if (!SSEDM_ParsePort(authority.substr(end + 2), &output->m_Port))
+            {
+                dmSnPrintf(error, error_size, "SSE URL port is invalid");
+                return false;
+            }
         }
     }
     else
@@ -260,7 +292,11 @@ static bool SSEPOSIX_ParseUrl(const char* url, SSEPOSIXUrl* output, char* error,
         if (first_colon != std::string::npos && first_colon == last_colon)
         {
             output->m_Host = authority.substr(0, first_colon);
-            output->m_Port = authority.substr(first_colon + 1);
+            if (!SSEDM_ParsePort(authority.substr(first_colon + 1), &output->m_Port))
+            {
+                dmSnPrintf(error, error_size, "SSE URL port is invalid");
+                return false;
+            }
         }
         else
         {
@@ -268,206 +304,69 @@ static bool SSEPOSIX_ParseUrl(const char* url, SSEPOSIXUrl* output, char* error,
         }
     }
 
-    if (output->m_Host.empty() || output->m_Port.empty())
+    if (output->m_Host.empty())
     {
-        dmSnPrintf(error, error_size, "SSE URL host or port is empty");
+        dmSnPrintf(error, error_size, "SSE URL host is empty");
         return false;
-    }
-
-    for (size_t i = 0; i < output->m_Port.size(); ++i)
-    {
-        if (!isdigit((unsigned char)output->m_Port[i]))
-        {
-            dmSnPrintf(error, error_size, "SSE URL port is invalid");
-            return false;
-        }
     }
 
     const bool is_ipv6 = output->m_Host.find(':') != std::string::npos;
     output->m_HostHeader = is_ipv6 ? "[" + output->m_Host + "]" : output->m_Host;
-    if (!SSEPOSIX_IsDefaultPort(output->m_Port))
+    if (!SSEDM_IsDefaultPort(output))
     {
-        output->m_HostHeader += ":";
-        output->m_HostHeader += output->m_Port;
+        char port[16];
+        dmSnPrintf(port, sizeof(port), ":%d", output->m_Port);
+        output->m_HostHeader += port;
     }
 
     return true;
 }
 
-static int SSEPOSIX_WaitSocket(SSEDesktopConnection* connection, int socket_fd, short events, int timeout_ms, short* revents)
+static dmSocket::Result SSEDM_WaitForSocket(SSEDesktopConnection* connection, dmSocket::SelectorKind kind)
 {
-    int elapsed = 0;
-    if (revents)
-    {
-        *revents = 0;
-    }
-
     while (!SSEDesktop_ShouldStop(connection))
     {
-        int step = 100;
-        if (timeout_ms >= 0)
-        {
-            const int remaining = timeout_ms - elapsed;
-            if (remaining <= 0)
-            {
-                return 0;
-            }
-            step = remaining < step ? remaining : step;
-        }
+        dmSocket::Selector selector;
+        dmSocket::SelectorZero(&selector);
+        dmSocket::SelectorSet(&selector, kind, connection->m_Socket);
 
-        struct pollfd poll_fd;
-        memset(&poll_fd, 0, sizeof(poll_fd));
-        poll_fd.fd = socket_fd;
-        poll_fd.events = events;
-
-        const int result = poll(&poll_fd, 1, step);
-        if (result > 0)
+        dmSocket::Result result = dmSocket::Select(&selector, SSE_DM_SOCKET_WAIT_US);
+        if (result != dmSocket::RESULT_WOULDBLOCK && result != dmSocket::RESULT_TRY_AGAIN)
         {
-            if (revents)
-            {
-                *revents = poll_fd.revents;
-            }
-            return 1;
-        }
-        if (result < 0)
-        {
-            if (errno == EINTR)
-            {
-                continue;
-            }
-            return -1;
-        }
-
-        if (timeout_ms >= 0)
-        {
-            elapsed += step;
+            return result;
         }
     }
 
-    return -2;
+    return dmSocket::RESULT_OK;
 }
 
-static bool SSEPOSIX_SetNonBlocking(int socket_fd, char* error, uint32_t error_size)
+static dmSocket::Result SSEDM_SendRaw(SSEDesktopConnection* connection, const char* buffer, int length, int* sent_bytes)
 {
-    const int flags = fcntl(socket_fd, F_GETFL, 0);
-    if (flags < 0 || fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK) < 0)
+    if (connection->m_SSLSocket)
     {
-        dmSnPrintf(error, error_size, "fcntl(O_NONBLOCK) failed: %s", strerror(errno));
-        return false;
+        return dmSSLSocket::Send(connection->m_SSLSocket, buffer, length, sent_bytes);
     }
 
-    return true;
+    return dmSocket::Send(connection->m_Socket, buffer, length, sent_bytes);
 }
 
-static void SSEPOSIX_SetKeepAlive(int socket_fd)
+static dmSocket::Result SSEDM_ReceiveRaw(SSEDesktopConnection* connection, void* buffer, int length, int* received_bytes)
 {
-    int value = 1;
-    setsockopt(socket_fd, SOL_SOCKET, SO_KEEPALIVE, &value, sizeof(value));
-#ifdef TCP_NODELAY
-    setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value));
-#endif
-}
-
-static bool SSEPOSIX_ConnectSocket(SSEDesktopConnection* connection, const SSEPOSIXUrl* url, char* error, uint32_t error_size)
-{
-    struct addrinfo hints;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_family = AF_UNSPEC;
-
-    struct addrinfo* addresses = 0;
-    const int address_result = getaddrinfo(url->m_Host.c_str(), url->m_Port.c_str(), &hints, &addresses);
-    if (address_result != 0)
+    if (connection->m_SSLSocket)
     {
-        dmSnPrintf(error, error_size, "getaddrinfo failed: %s", gai_strerror(address_result));
-        return false;
+        return dmSSLSocket::Receive(connection->m_SSLSocket, buffer, length, received_bytes);
     }
 
-    char last_error[256];
-    last_error[0] = 0;
-
-    for (struct addrinfo* address = addresses; address; address = address->ai_next)
-    {
-        if (SSEDesktop_ShouldStop(connection))
-        {
-            freeaddrinfo(addresses);
-            return true;
-        }
-
-        const int socket_fd = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
-        if (socket_fd < 0)
-        {
-            dmSnPrintf(last_error, sizeof(last_error), "socket failed: %s", strerror(errno));
-            continue;
-        }
-
-        SSEPOSIX_SetSocket(connection, socket_fd);
-        if (!SSEPOSIX_SetNonBlocking(socket_fd, last_error, sizeof(last_error)))
-        {
-            SSEPOSIX_CloseActiveSocket(connection);
-            continue;
-        }
-
-        SSEPOSIX_SetKeepAlive(socket_fd);
-
-        int connect_result = connect(socket_fd, address->ai_addr, address->ai_addrlen);
-        if (connect_result == 0)
-        {
-            freeaddrinfo(addresses);
-            return true;
-        }
-
-        if (errno == EINPROGRESS)
-        {
-            short revents = 0;
-            const int wait_result = SSEPOSIX_WaitSocket(connection, socket_fd, POLLOUT, 15000, &revents);
-            if (wait_result == -2)
-            {
-                freeaddrinfo(addresses);
-                return true;
-            }
-            if (wait_result == 0)
-            {
-                dmSnPrintf(last_error, sizeof(last_error), "connect timed out");
-                SSEPOSIX_CloseActiveSocket(connection);
-                continue;
-            }
-            if (wait_result < 0)
-            {
-                dmSnPrintf(last_error, sizeof(last_error), "poll connect failed: %s", strerror(errno));
-                SSEPOSIX_CloseActiveSocket(connection);
-                continue;
-            }
-
-            int socket_error = 0;
-            socklen_t socket_error_size = sizeof(socket_error);
-            if (getsockopt(socket_fd, SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_size) == 0 && socket_error == 0)
-            {
-                freeaddrinfo(addresses);
-                return true;
-            }
-
-            dmSnPrintf(last_error, sizeof(last_error), "connect failed: %s", strerror(socket_error ? socket_error : errno));
-            SSEPOSIX_CloseActiveSocket(connection);
-            continue;
-        }
-
-        dmSnPrintf(last_error, sizeof(last_error), "connect failed: %s", strerror(errno));
-        SSEPOSIX_CloseActiveSocket(connection);
-    }
-
-    freeaddrinfo(addresses);
-    dmSnPrintf(error, error_size, "%s", last_error[0] ? last_error : "connect failed");
-    return false;
+    return dmSocket::Receive(connection->m_Socket, buffer, length, received_bytes);
 }
 
-static bool SSEPOSIX_AppendHeader(std::string* request, const char* name, const char* value, char* error, uint32_t error_size)
+static bool SSEDM_AppendHeader(std::string* request, const char* name, const char* value, char* error, uint32_t error_size)
 {
     if (!name || !value)
     {
         return true;
     }
-    if (!name[0] || SSEPOSIX_HasControlChars(name) || SSEPOSIX_HasControlChars(value) || strchr(name, ':') != 0)
+    if (!name[0] || SSEDM_HasControlChars(name) || SSEDM_HasControlChars(value) || strchr(name, ':') != 0)
     {
         dmSnPrintf(error, error_size, "invalid SSE request header");
         return false;
@@ -480,7 +379,7 @@ static bool SSEPOSIX_AppendHeader(std::string* request, const char* name, const 
     return true;
 }
 
-static bool SSEPOSIX_BuildRequest(SSEDesktopConnection* connection, const SSEPOSIXUrl* url, std::string* request, char* error, uint32_t error_size)
+static bool SSEDM_BuildRequest(SSEDesktopConnection* connection, const SSEDMUrl* url, std::string* request, char* error, uint32_t error_size)
 {
     request->clear();
     request->append("GET ");
@@ -496,7 +395,7 @@ static bool SSEPOSIX_BuildRequest(SSEDesktopConnection* connection, const SSEPOS
 
     for (uint32_t i = 0; i < connection->m_Headers.Size(); ++i)
     {
-        if (!SSEPOSIX_AppendHeader(request, connection->m_Headers[i].m_Name, connection->m_Headers[i].m_Value, error, error_size))
+        if (!SSEDM_AppendHeader(request, connection->m_Headers[i].m_Name, connection->m_Headers[i].m_Value, error, error_size))
         {
             return false;
         }
@@ -504,7 +403,7 @@ static bool SSEPOSIX_BuildRequest(SSEDesktopConnection* connection, const SSEPOS
 
     if (connection->m_LastEventId && connection->m_LastEventId[0])
     {
-        if (!SSEPOSIX_AppendHeader(request, "Last-Event-ID", connection->m_LastEventId, error, error_size))
+        if (!SSEDM_AppendHeader(request, "Last-Event-ID", connection->m_LastEventId, error, error_size))
         {
             return false;
         }
@@ -514,43 +413,45 @@ static bool SSEPOSIX_BuildRequest(SSEDesktopConnection* connection, const SSEPOS
     return true;
 }
 
-static bool SSEPOSIX_SendAll(SSEDesktopConnection* connection, int socket_fd, const std::string& request, char* error, uint32_t error_size)
+static bool SSEDM_SendAll(SSEDesktopConnection* connection, const std::string& request, char* error, uint32_t error_size)
 {
     const char* data = request.data();
-    size_t remaining = request.size();
+    int remaining = (int)request.size();
 
     while (remaining > 0 && !SSEDesktop_ShouldStop(connection))
     {
-        const ssize_t sent = send(socket_fd, data, remaining, MSG_NOSIGNAL);
-        if (sent > 0)
+        int sent = 0;
+        dmSocket::Result result = SSEDM_SendRaw(connection, data, remaining, &sent);
+        if (result == dmSocket::RESULT_OK)
         {
+            if (sent <= 0)
+            {
+                result = SSEDM_WaitForSocket(connection, dmSocket::SELECTOR_KIND_WRITE);
+                if (result != dmSocket::RESULT_OK)
+                {
+                    dmSnPrintf(error, error_size, "socket send wait failed: %s", dmSocket::ResultToString(result));
+                    return false;
+                }
+                continue;
+            }
+
             data += sent;
-            remaining -= (size_t)sent;
+            remaining -= sent;
             continue;
         }
 
-        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+        if (result == dmSocket::RESULT_WOULDBLOCK || result == dmSocket::RESULT_TRY_AGAIN)
         {
-            short revents = 0;
-            const int wait_result = SSEPOSIX_WaitSocket(connection, socket_fd, POLLOUT, 15000, &revents);
-            if (wait_result == -2)
+            result = SSEDM_WaitForSocket(connection, dmSocket::SELECTOR_KIND_WRITE);
+            if (result != dmSocket::RESULT_OK)
             {
-                return true;
-            }
-            if (wait_result == 0)
-            {
-                dmSnPrintf(error, error_size, "timed out while sending SSE request");
-                return false;
-            }
-            if (wait_result < 0)
-            {
-                dmSnPrintf(error, error_size, "poll send failed: %s", strerror(errno));
+                dmSnPrintf(error, error_size, "socket send wait failed: %s", dmSocket::ResultToString(result));
                 return false;
             }
             continue;
         }
 
-        dmSnPrintf(error, error_size, "send failed: %s", strerror(errno));
+        dmSnPrintf(error, error_size, "socket send failed: %s", dmSocket::ResultToString(result));
         return false;
     }
 
@@ -581,7 +482,7 @@ static void SSEDesktop_OnParserId(void* context, const char* id)
     SSE_SetLastEventId(connection->m_Handle, id);
 }
 
-static bool SSEPOSIX_ParseChunkSize(const std::string& line, size_t* size)
+static bool SSEDM_ParseChunkSize(const std::string& line, size_t* size)
 {
     size_t value = 0;
     bool has_digit = false;
@@ -633,17 +534,17 @@ static bool SSEPOSIX_ParseChunkSize(const std::string& line, size_t* size)
     return true;
 }
 
-static bool SSEPOSIX_FeedChunkedBody(SSEDesktopConnection* connection, SSEPOSIXChunkDecoder* decoder, const char* data, size_t size, const SSEParserCallbacks* callbacks, char* error, uint32_t error_size)
+static bool SSEDM_FeedChunkedBody(SSEDesktopConnection* connection, SSEDMChunkDecoder* decoder, const char* data, size_t size, const SSEParserCallbacks* callbacks, char* error, uint32_t error_size)
 {
     size_t offset = 0;
     while (offset < size)
     {
-        if (decoder->m_State == SSEPOSIXChunkDecoder::STATE_DONE)
+        if (decoder->m_State == SSEDMChunkDecoder::STATE_DONE)
         {
             return true;
         }
 
-        if (decoder->m_State == SSEPOSIXChunkDecoder::STATE_SIZE)
+        if (decoder->m_State == SSEDMChunkDecoder::STATE_SIZE)
         {
             const char c = data[offset++];
             decoder->m_Line.push_back(c);
@@ -661,7 +562,7 @@ static bool SSEPOSIX_FeedChunkedBody(SSEDesktopConnection* connection, SSEPOSIXC
                 }
 
                 size_t chunk_size = 0;
-                if (!SSEPOSIX_ParseChunkSize(decoder->m_Line, &chunk_size))
+                if (!SSEDM_ParseChunkSize(decoder->m_Line, &chunk_size))
                 {
                     dmSnPrintf(error, error_size, "invalid chunk size");
                     return false;
@@ -669,12 +570,12 @@ static bool SSEPOSIX_FeedChunkedBody(SSEDesktopConnection* connection, SSEPOSIXC
 
                 decoder->m_Line.clear();
                 decoder->m_Remaining = chunk_size;
-                decoder->m_State = chunk_size == 0 ? SSEPOSIXChunkDecoder::STATE_DONE : SSEPOSIXChunkDecoder::STATE_DATA;
+                decoder->m_State = chunk_size == 0 ? SSEDMChunkDecoder::STATE_DONE : SSEDMChunkDecoder::STATE_DATA;
             }
             continue;
         }
 
-        if (decoder->m_State == SSEPOSIXChunkDecoder::STATE_DATA)
+        if (decoder->m_State == SSEDMChunkDecoder::STATE_DATA)
         {
             const size_t available = size - offset;
             const size_t chunk = decoder->m_Remaining < available ? decoder->m_Remaining : available;
@@ -687,21 +588,21 @@ static bool SSEPOSIX_FeedChunkedBody(SSEDesktopConnection* connection, SSEPOSIXC
 
             if (decoder->m_Remaining == 0)
             {
-                decoder->m_State = SSEPOSIXChunkDecoder::STATE_DATA_CRLF;
+                decoder->m_State = SSEDMChunkDecoder::STATE_DATA_CRLF;
             }
             continue;
         }
 
-        if (decoder->m_State == SSEPOSIXChunkDecoder::STATE_DATA_CRLF)
+        if (decoder->m_State == SSEDMChunkDecoder::STATE_DATA_CRLF)
         {
             const char c = data[offset++];
             if (c == '\r')
             {
-                decoder->m_State = SSEPOSIXChunkDecoder::STATE_DATA_LF;
+                decoder->m_State = SSEDMChunkDecoder::STATE_DATA_LF;
             }
             else if (c == '\n')
             {
-                decoder->m_State = SSEPOSIXChunkDecoder::STATE_SIZE;
+                decoder->m_State = SSEDMChunkDecoder::STATE_SIZE;
             }
             else
             {
@@ -711,7 +612,7 @@ static bool SSEPOSIX_FeedChunkedBody(SSEDesktopConnection* connection, SSEPOSIXC
             continue;
         }
 
-        if (decoder->m_State == SSEPOSIXChunkDecoder::STATE_DATA_LF)
+        if (decoder->m_State == SSEDMChunkDecoder::STATE_DATA_LF)
         {
             const char c = data[offset++];
             if (c != '\n')
@@ -719,14 +620,14 @@ static bool SSEPOSIX_FeedChunkedBody(SSEDesktopConnection* connection, SSEPOSIXC
                 dmSnPrintf(error, error_size, "invalid chunk delimiter");
                 return false;
             }
-            decoder->m_State = SSEPOSIXChunkDecoder::STATE_SIZE;
+            decoder->m_State = SSEDMChunkDecoder::STATE_SIZE;
         }
     }
 
     return true;
 }
 
-static size_t SSEPOSIX_FindHeaderEnd(const std::string& response, size_t* delimiter_size)
+static size_t SSEDM_FindHeaderEnd(const std::string& response, size_t* delimiter_size)
 {
     size_t end = response.find("\r\n\r\n");
     if (end != std::string::npos)
@@ -745,7 +646,7 @@ static size_t SSEPOSIX_FindHeaderEnd(const std::string& response, size_t* delimi
     return std::string::npos;
 }
 
-static std::string SSEPOSIX_TrimTrailingCR(std::string line)
+static std::string SSEDM_TrimTrailingCR(std::string line)
 {
     if (!line.empty() && line[line.size() - 1] == '\r')
     {
@@ -754,13 +655,13 @@ static std::string SSEPOSIX_TrimTrailingCR(std::string line)
     return line;
 }
 
-static bool SSEPOSIX_ParseResponseHeaders(const std::string& headers, int32_t* status, bool* chunked, char* error, uint32_t error_size)
+static bool SSEDM_ParseResponseHeaders(const std::string& headers, int32_t* status, bool* chunked, char* error, uint32_t error_size)
 {
     *status = 0;
     *chunked = false;
 
     const size_t first_line_end = headers.find('\n');
-    const std::string first_line = SSEPOSIX_TrimTrailingCR(headers.substr(0, first_line_end));
+    const std::string first_line = SSEDM_TrimTrailingCR(headers.substr(0, first_line_end));
     int parsed_status = 0;
     if (sscanf(first_line.c_str(), "HTTP/%*s %d", &parsed_status) != 1)
     {
@@ -774,8 +675,8 @@ static bool SSEPOSIX_ParseResponseHeaders(const std::string& headers, int32_t* s
     {
         const size_t line_end = headers.find('\n', line_start);
         const size_t count = line_end == std::string::npos ? headers.size() - line_start : line_end - line_start;
-        const std::string line = SSEPOSIX_TrimTrailingCR(headers.substr(line_start, count));
-        const std::string lower = SSEPOSIX_LowerASCII(line);
+        const std::string line = SSEDM_TrimTrailingCR(headers.substr(line_start, count));
+        const std::string lower = SSEDM_LowerASCII(line);
 
         if (lower.find("transfer-encoding:") == 0 && lower.find("chunked") != std::string::npos)
         {
@@ -792,7 +693,7 @@ static bool SSEPOSIX_ParseResponseHeaders(const std::string& headers, int32_t* s
     return true;
 }
 
-static bool SSEPOSIX_FeedBody(SSEDesktopConnection* connection, bool chunked, SSEPOSIXChunkDecoder* chunk_decoder, const char* data, size_t size, const SSEParserCallbacks* callbacks, char* error, uint32_t error_size)
+static bool SSEDM_FeedBody(SSEDesktopConnection* connection, bool chunked, SSEDMChunkDecoder* chunk_decoder, const char* data, size_t size, const SSEParserCallbacks* callbacks, char* error, uint32_t error_size)
 {
     if (size == 0)
     {
@@ -801,20 +702,20 @@ static bool SSEPOSIX_FeedBody(SSEDesktopConnection* connection, bool chunked, SS
 
     if (chunked)
     {
-        return SSEPOSIX_FeedChunkedBody(connection, chunk_decoder, data, size, callbacks, error, error_size);
+        return SSEDM_FeedChunkedBody(connection, chunk_decoder, data, size, callbacks, error, error_size);
     }
 
     connection->m_Parser.Feed(data, size, callbacks, connection);
     return true;
 }
 
-static bool SSEPOSIX_ReadResponse(SSEDesktopConnection* connection, int socket_fd, char* error, uint32_t error_size)
+static bool SSEDM_ReadResponse(SSEDesktopConnection* connection, char* error, uint32_t error_size)
 {
     char buffer[8192];
     std::string header_buffer;
     bool headers_done = false;
     bool chunked = false;
-    SSEPOSIXChunkDecoder chunk_decoder;
+    SSEDMChunkDecoder chunk_decoder;
 
     SSEParserCallbacks callbacks;
     callbacks.m_OnEvent = SSEDesktop_OnParserEvent;
@@ -823,84 +724,26 @@ static bool SSEPOSIX_ReadResponse(SSEDesktopConnection* connection, int socket_f
 
     while (!SSEDesktop_ShouldStop(connection))
     {
-        short revents = 0;
-        const int wait_result = SSEPOSIX_WaitSocket(connection, socket_fd, POLLIN, -1, &revents);
-        if (wait_result == -2)
+        int received = 0;
+        dmSocket::Result result = SSEDM_ReceiveRaw(connection, buffer, sizeof(buffer), &received);
+        if (result == dmSocket::RESULT_WOULDBLOCK || result == dmSocket::RESULT_TRY_AGAIN)
         {
-            return true;
-        }
-        if (wait_result < 0)
-        {
-            dmSnPrintf(error, error_size, "poll read failed: %s", strerror(errno));
-            return false;
-        }
-
-        if ((revents & (POLLERR | POLLNVAL)) && !(revents & POLLIN))
-        {
-            dmSnPrintf(error, error_size, "socket read failed");
-            return false;
-        }
-
-        const ssize_t received = recv(socket_fd, buffer, sizeof(buffer), 0);
-        if (received > 0)
-        {
-            if (!headers_done)
+            result = SSEDM_WaitForSocket(connection, dmSocket::SELECTOR_KIND_READ);
+            if (result != dmSocket::RESULT_OK)
             {
-                header_buffer.append(buffer, (size_t)received);
-                if (header_buffer.size() > 65536)
-                {
-                    dmSnPrintf(error, error_size, "HTTP response headers are too large");
-                    return false;
-                }
-
-                size_t delimiter_size = 0;
-                const size_t header_end = SSEPOSIX_FindHeaderEnd(header_buffer, &delimiter_size);
-                if (header_end == std::string::npos)
-                {
-                    continue;
-                }
-
-                if (!SSEPOSIX_ParseResponseHeaders(header_buffer.substr(0, header_end), &connection->m_Status, &chunked, error, error_size))
-                {
-                    return false;
-                }
-
-                if (connection->m_Status < 200 || connection->m_Status >= 300)
-                {
-                    dmSnPrintf(error, error_size, "SSE request failed with HTTP status %d", connection->m_Status);
-                    return false;
-                }
-
-                connection->m_Opened = 1;
-                SSE_EnqueueOpen(connection->m_Handle, connection->m_Status);
-                headers_done = true;
-
-                const size_t body_start = header_end + delimiter_size;
-                if (body_start < header_buffer.size())
-                {
-                    if (!SSEPOSIX_FeedBody(connection, chunked, &chunk_decoder, header_buffer.data() + body_start, header_buffer.size() - body_start, &callbacks, error, error_size))
-                    {
-                        return false;
-                    }
-                    if (chunked && chunk_decoder.m_State == SSEPOSIXChunkDecoder::STATE_DONE)
-                    {
-                        return true;
-                    }
-                }
-                header_buffer.clear();
-            }
-            else
-            {
-                if (!SSEPOSIX_FeedBody(connection, chunked, &chunk_decoder, buffer, (size_t)received, &callbacks, error, error_size))
-                {
-                    return false;
-                }
-                if (chunked && chunk_decoder.m_State == SSEPOSIXChunkDecoder::STATE_DONE)
-                {
-                    return true;
-                }
+                dmSnPrintf(error, error_size, "socket read wait failed: %s", dmSocket::ResultToString(result));
+                return false;
             }
             continue;
+        }
+        if (result != dmSocket::RESULT_OK)
+        {
+            if (SSEDesktop_ShouldStop(connection))
+            {
+                return true;
+            }
+            dmSnPrintf(error, error_size, "socket receive failed: %s", dmSocket::ResultToString(result));
+            return false;
         }
 
         if (received == 0)
@@ -908,18 +751,62 @@ static bool SSEPOSIX_ReadResponse(SSEDesktopConnection* connection, int socket_f
             return true;
         }
 
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+        if (!headers_done)
         {
-            continue;
-        }
+            header_buffer.append(buffer, (size_t)received);
+            if (header_buffer.size() > 65536)
+            {
+                dmSnPrintf(error, error_size, "HTTP response headers are too large");
+                return false;
+            }
 
-        if (SSEDesktop_ShouldStop(connection))
+            size_t delimiter_size = 0;
+            const size_t header_end = SSEDM_FindHeaderEnd(header_buffer, &delimiter_size);
+            if (header_end == std::string::npos)
+            {
+                continue;
+            }
+
+            if (!SSEDM_ParseResponseHeaders(header_buffer.substr(0, header_end), &connection->m_Status, &chunked, error, error_size))
+            {
+                return false;
+            }
+
+            if (connection->m_Status < 200 || connection->m_Status >= 300)
+            {
+                dmSnPrintf(error, error_size, "SSE request failed with HTTP status %d", connection->m_Status);
+                return false;
+            }
+
+            connection->m_Opened = 1;
+            SSE_EnqueueOpen(connection->m_Handle, connection->m_Status);
+            headers_done = true;
+
+            const size_t body_start = header_end + delimiter_size;
+            if (body_start < header_buffer.size())
+            {
+                if (!SSEDM_FeedBody(connection, chunked, &chunk_decoder, header_buffer.data() + body_start, header_buffer.size() - body_start, &callbacks, error, error_size))
+                {
+                    return false;
+                }
+                if (chunked && chunk_decoder.m_State == SSEDMChunkDecoder::STATE_DONE)
+                {
+                    return true;
+                }
+            }
+            header_buffer.clear();
+        }
+        else
         {
-            return true;
+            if (!SSEDM_FeedBody(connection, chunked, &chunk_decoder, buffer, (size_t)received, &callbacks, error, error_size))
+            {
+                return false;
+            }
+            if (chunked && chunk_decoder.m_State == SSEDMChunkDecoder::STATE_DONE)
+            {
+                return true;
+            }
         }
-
-        dmSnPrintf(error, error_size, "recv failed: %s", strerror(errno));
-        return false;
     }
 
     return true;
@@ -927,8 +814,14 @@ static bool SSEPOSIX_ReadResponse(SSEDesktopConnection* connection, int socket_f
 
 static bool SSEDesktop_PerformOnce(SSEDesktopConnection* connection, char* error, uint32_t error_size)
 {
-    SSEPOSIXUrl url;
-    if (!SSEPOSIX_ParseUrl(connection->m_Url, &url, error, error_size))
+    if (!g_SSEConnectionPool)
+    {
+        dmSnPrintf(error, error_size, "Defold connection pool is not initialized");
+        return false;
+    }
+
+    SSEDMUrl url;
+    if (!SSEDM_ParseUrl(connection->m_Url, &url, error, error_size))
     {
         return false;
     }
@@ -936,40 +829,51 @@ static bool SSEDesktop_PerformOnce(SSEDesktopConnection* connection, char* error
     connection->m_Parser.Reset();
     connection->m_Status = 0;
     connection->m_Opened = 0;
+    connection->m_Secure = url.m_Secure;
 
-    if (!SSEPOSIX_ConnectSocket(connection, &url, error, error_size))
+    dmSocket::Result socket_result = dmSocket::RESULT_OK;
+    dmConnectionPool::HConnection pool_connection = 0;
+    connection->m_CancelFlag = 0;
+    dmConnectionPool::Result pool_result = dmConnectionPool::Dial(g_SSEConnectionPool, url.m_Host.c_str(), url.m_Port, url.m_Secure != 0, SSE_DM_CONNECT_TIMEOUT_US, &connection->m_CancelFlag, &pool_connection, &socket_result);
+    if (pool_result != dmConnectionPool::RESULT_OK)
     {
-        SSEPOSIX_CloseActiveSocket(connection);
+        dmSnPrintf(error, error_size, "failed to open SSE connection: %s", dmSocket::ResultToString(socket_result));
         return false;
+    }
+
+    SSEDM_SetConnection(connection, pool_connection);
+    connection->m_Socket = dmConnectionPool::GetSocket(g_SSEConnectionPool, pool_connection);
+    connection->m_SSLSocket = dmConnectionPool::GetSSLSocket(g_SSEConnectionPool, pool_connection);
+
+    dmSocket::SetNoDelay(connection->m_Socket, true);
+    dmSocket::SetBlocking(connection->m_Socket, false);
+    dmSocket::SetReceiveTimeout(connection->m_Socket, 1000);
+    if (connection->m_SSLSocket)
+    {
+        dmSSLSocket::SetReceiveTimeout(connection->m_SSLSocket, 1000);
     }
 
     if (SSEDesktop_ShouldStop(connection))
     {
-        SSEPOSIX_CloseActiveSocket(connection);
-        return true;
-    }
-
-    const int socket_fd = SSEPOSIX_GetSocket(connection);
-    if (socket_fd < 0)
-    {
+        SSEDM_CloseActiveConnection(connection);
         return true;
     }
 
     std::string request;
-    if (!SSEPOSIX_BuildRequest(connection, &url, &request, error, error_size))
+    if (!SSEDM_BuildRequest(connection, &url, &request, error, error_size))
     {
-        SSEPOSIX_CloseActiveSocket(connection);
+        SSEDM_CloseActiveConnection(connection);
         return false;
     }
 
-    if (!SSEPOSIX_SendAll(connection, socket_fd, request, error, error_size))
+    if (!SSEDM_SendAll(connection, request, error, error_size))
     {
-        SSEPOSIX_CloseActiveSocket(connection);
+        SSEDM_CloseActiveConnection(connection);
         return false;
     }
 
-    const bool read_ok = SSEPOSIX_ReadResponse(connection, socket_fd, error, error_size);
-    SSEPOSIX_CloseActiveSocket(connection);
+    const bool read_ok = SSEDM_ReadResponse(connection, error, error_size);
+    SSEDM_CloseActiveConnection(connection);
 
     if (SSEDesktop_ShouldStop(connection))
     {
@@ -1002,7 +906,7 @@ static void SSEDesktop_Worker(void* data)
         ++attempt;
 
         SSE_DebugLog(
-            "posix attempt #%u start handle=%d reconnect=%d retry_ms=%d url=%s",
+            "dmconnection attempt #%u start handle=%d reconnect=%d retry_ms=%d url=%s",
             attempt,
             connection->m_Handle,
             connection->m_Reconnect,
@@ -1013,7 +917,7 @@ static void SSEDesktop_Worker(void* data)
         SSE_SetConnected(connection->m_Handle, false);
 
         SSE_DebugLog(
-            "posix attempt #%u finish handle=%d ok=%d status=%d reconnect=%d error=%s",
+            "dmconnection attempt #%u finish handle=%d ok=%d status=%d reconnect=%d error=%s",
             attempt,
             connection->m_Handle,
             ok ? 1 : 0,
@@ -1033,11 +937,11 @@ static void SSEDesktop_Worker(void* data)
 
         if (!connection->m_Reconnect)
         {
-            SSE_DebugLog("posix worker stop handle=%d reconnect disabled", connection->m_Handle);
+            SSE_DebugLog("dmconnection worker stop handle=%d reconnect disabled", connection->m_Handle);
             break;
         }
 
-        SSE_DebugLog("posix retry sleep handle=%d retry_ms=%d", connection->m_Handle, connection->m_RetryMS);
+        SSE_DebugLog("dmconnection retry sleep handle=%d retry_ms=%d", connection->m_Handle, connection->m_RetryMS);
         SSEDesktop_SleepRetry(connection);
     }
 
@@ -1049,20 +953,47 @@ static void SSEDesktop_Worker(void* data)
 
 bool SSE_Platform_Initialize()
 {
+    if (!g_SSEConnectionPool)
+    {
+        dmConnectionPool::Params pool_params;
+        memset(&pool_params, 0, sizeof(pool_params));
+        pool_params.m_MaxConnections = 16;
+
+        dmConnectionPool::Result result = dmConnectionPool::New(&pool_params, &g_SSEConnectionPool);
+        if (result != dmConnectionPool::RESULT_OK)
+        {
+            dmLogError("failed to create SSE connection pool: %d", result);
+            g_SSEConnectionPool = 0;
+            return false;
+        }
+    }
+
     return true;
 }
 
 void SSE_Platform_Finalize()
 {
+    if (g_SSEConnectionPool)
+    {
+        dmConnectionPool::Shutdown(g_SSEConnectionPool, dmSocket::SHUTDOWNTYPE_READWRITE);
+        dmConnectionPool::Delete(g_SSEConnectionPool);
+        g_SSEConnectionPool = 0;
+    }
 }
 
 bool SSE_Platform_IsSupported()
 {
-    return true;
+    return g_SSEConnectionPool != 0;
 }
 
 bool SSE_Platform_Connect(SSEConnection* connection, char* error, uint32_t error_size)
 {
+    if (!g_SSEConnectionPool)
+    {
+        dmSnPrintf(error, error_size, "Defold connection pool is not initialized");
+        return false;
+    }
+
     SSEDesktopConnection* desktop = new SSEDesktopConnection;
     desktop->m_Handle = connection->m_Handle;
     desktop->m_Url = SSEDesktop_StrDup(connection->m_Url);
@@ -1116,9 +1047,10 @@ void SSE_Platform_Disconnect(SSEConnection* connection)
     {
         DM_MUTEX_SCOPED_LOCK(desktop->m_Mutex);
         desktop->m_Stop = 1;
+        desktop->m_CancelFlag = 1;
     }
 
-    SSEPOSIX_CloseActiveSocket(desktop);
+    SSEDM_CloseActiveConnection(desktop);
 
     if (desktop->m_Thread)
     {

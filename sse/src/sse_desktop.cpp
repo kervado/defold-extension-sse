@@ -467,9 +467,9 @@ bool SSE_Platform_IsConnected(SSEConnection* connection)
     return desktop && desktop->m_Opened != 0 && !SSEDesktop_ShouldStop(desktop);
 }
 
-#elif defined(SSE_USE_POSIX_HTTP)
+#elif defined(SSE_USE_DMCONNECTION)
 
-#include "sse_posix_impl.h"
+#include "sse_connection_pool_impl.h"
 
 #elif defined(SSE_USE_WINHTTP)
 
