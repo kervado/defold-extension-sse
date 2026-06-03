@@ -7,7 +7,7 @@ Standalone Defold native extension for Server-Sent Events (SSE) with custom requ
 After publishing this folder as a public GitHub repository, create a release and add the release zip to your Defold project's `game.project` dependencies:
 
 ```text
-https://github.com/<owner>/<repo>/archive/refs/tags/<version>.zip
+https://github.com/kervado/defold-extension-sse/archive/refs/tags/<version>.zip
 ```
 
 Using a fixed release tag is recommended over `main.zip` so game builds stay reproducible.
