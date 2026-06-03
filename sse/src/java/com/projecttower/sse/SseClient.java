@@ -1,27 +1,20 @@
 package com.projecttower.sse;
 
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
-import okhttp3.Call;
-import okhttp3.Callback;
-import okhttp3.OkHttpClient;
-import okhttp3.Request;
-import okhttp3.Response;
-import okhttp3.ResponseBody;
-import okio.BufferedSource;
-
 public final class SseClient {
-    private static final OkHttpClient HTTP = new OkHttpClient.Builder()
-            .connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(0, TimeUnit.MILLISECONDS)
-            .retryOnConnectionFailure(true)
-            .build();
-
     private final long handle;
     private final String url;
     private final Map<String, String> headers;
@@ -29,7 +22,7 @@ public final class SseClient {
     private final ScheduledExecutorService scheduler;
 
     private volatile boolean stopped;
-    private volatile Call call;
+    private volatile HttpURLConnection connection;
     private volatile int retryMs;
     private volatile String lastEventId;
 
@@ -59,9 +52,9 @@ public final class SseClient {
 
     public void disconnect() {
         stopped = true;
-        Call active = call;
+        HttpURLConnection active = connection;
         if (active != null) {
-            active.cancel();
+            active.disconnect();
         }
         scheduler.shutdownNow();
     }
@@ -71,67 +64,77 @@ public final class SseClient {
             return;
         }
 
-        Request.Builder builder = new Request.Builder()
-                .url(url)
-                .header("Accept", "text/event-stream")
-                .header("Cache-Control", "no-cache");
-
-        for (Map.Entry<String, String> entry : headers.entrySet()) {
-            builder.header(entry.getKey(), entry.getValue());
-        }
-
-        if (lastEventId != null && lastEventId.length() > 0) {
-            builder.header("Last-Event-ID", lastEventId);
-        }
-
-        call = HTTP.newCall(builder.build());
-        call.enqueue(new Callback() {
-            @Override
-            public void onFailure(Call call, IOException e) {
-                if (stopped) {
-                    return;
+        try {
+            scheduler.execute(new Runnable() {
+                @Override
+                public void run() {
+                    openAndRead();
                 }
-                nativeOnError(handle, e.getMessage() == null ? "SSE request failed" : e.getMessage(), 0, reconnect, retryMs);
-                scheduleReconnectOrClose();
-            }
-
-            @Override
-            public void onResponse(Call call, Response response) {
-                try {
-                    if (!response.isSuccessful()) {
-                        nativeOnError(handle, "SSE request failed with HTTP status " + response.code(), response.code(), reconnect, retryMs);
-                        scheduleReconnectOrClose();
-                        return;
-                    }
-
-                    nativeOnOpen(handle, response.code());
-                    ResponseBody body = response.body();
-                    if (body == null) {
-                        nativeOnError(handle, "SSE response body was empty", response.code(), reconnect, retryMs);
-                        scheduleReconnectOrClose();
-                        return;
-                    }
-
-                    readStream(body.source());
-                    if (!stopped) {
-                        scheduleReconnectOrClose();
-                    }
-                } catch (IOException e) {
-                    if (!stopped) {
-                        nativeOnError(handle, e.getMessage() == null ? "SSE stream failed" : e.getMessage(), response.code(), reconnect, retryMs);
-                        scheduleReconnectOrClose();
-                    }
-                } finally {
-                    response.close();
-                }
-            }
-        });
+            });
+        } catch (RejectedExecutionException ignored) {
+        }
     }
 
-    private void readStream(BufferedSource source) throws IOException {
+    private void openAndRead() {
+        HttpURLConnection active = null;
+        int status = 0;
+
+        try {
+            active = (HttpURLConnection) new URL(url).openConnection();
+            connection = active;
+
+            active.setRequestMethod("GET");
+            active.setConnectTimeout(15000);
+            active.setReadTimeout(0);
+            active.setUseCaches(false);
+            active.setDoInput(true);
+            active.setRequestProperty("Accept", "text/event-stream");
+            active.setRequestProperty("Cache-Control", "no-cache");
+
+            for (Map.Entry<String, String> entry : headers.entrySet()) {
+                active.setRequestProperty(entry.getKey(), entry.getValue());
+            }
+
+            if (lastEventId != null && lastEventId.length() > 0) {
+                active.setRequestProperty("Last-Event-ID", lastEventId);
+            }
+
+            status = active.getResponseCode();
+            if (stopped) {
+                return;
+            }
+
+            if (status < 200 || status >= 300) {
+                nativeOnError(handle, "SSE request failed with HTTP status " + status, status, reconnect, retryMs);
+                scheduleReconnectOrClose();
+                return;
+            }
+
+            nativeOnOpen(handle, status);
+            readStream(active.getInputStream());
+            if (!stopped) {
+                scheduleReconnectOrClose();
+            }
+        } catch (IOException e) {
+            if (!stopped) {
+                nativeOnError(handle, e.getMessage() == null ? "SSE stream failed" : e.getMessage(), status, reconnect, retryMs);
+                scheduleReconnectOrClose();
+            }
+        } finally {
+            if (active != null) {
+                active.disconnect();
+            }
+            if (connection == active) {
+                connection = null;
+            }
+        }
+    }
+
+    private void readStream(InputStream input) throws IOException {
+        BufferedReader reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8));
         SseParser parser = new SseParser();
         while (!stopped) {
-            String line = source.readUtf8Line();
+            String line = reader.readLine();
             if (line == null) {
                 break;
             }
@@ -149,12 +152,15 @@ public final class SseClient {
             return;
         }
 
-        scheduler.schedule(new Runnable() {
-            @Override
-            public void run() {
-                start();
-            }
-        }, retryMs, TimeUnit.MILLISECONDS);
+        try {
+            scheduler.schedule(new Runnable() {
+                @Override
+                public void run() {
+                    openAndRead();
+                }
+            }, retryMs, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException ignored) {
+        }
     }
 
     private final class SseParser {
@@ -237,4 +243,3 @@ public final class SseClient {
     private static native void nativeOnRetry(long handle, int retryMs);
     private static native void nativeOnLastEventId(long handle, String id);
 }
-

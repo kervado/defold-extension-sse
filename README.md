@@ -95,7 +95,7 @@ When enabled, adapters reconnect after close or error unless the user called `di
 | macOS | Implemented | C++ worker thread with libcurl and native SSE parser. |
 | Linux | Implemented | C++ worker thread with Defold `dmConnectionPool`/`dmSSLSocket`, chunked HTTP decoding, and native SSE parser. Supports `http://` and `https://` without external linker dependencies. |
 | Windows | Implemented | C++ worker thread with WinHTTP and native SSE parser. |
-| Android | Implemented | Java adapter using OkHttp streaming response and Java SSE parser. |
+| Android | Implemented | Java adapter using `HttpURLConnection`/`HttpsURLConnection` streaming response and Java SSE parser. |
 | iOS | Implemented | Objective-C++ adapter using `NSURLSessionDataDelegate` streaming and byte-oriented SSE parser. |
 | HTML5 | Implemented | JavaScript `fetch` + `ReadableStream`, chosen so custom headers such as `Authorization` work. |
 | Other | Compile-safe unsupported stub | `sse.is_supported()` returns false. |
@@ -114,7 +114,7 @@ examples/
 game.project
 ```
 
-The Android adapter declares OkHttp in `sse/manifests/android/build.gradle`. The iOS adapter uses only Foundation and does not require CocoaPods. The Windows adapter uses the system WinHTTP library and does not require bundled DLLs.
+The Android adapter uses platform `HttpURLConnection`/`HttpsURLConnection` and does not require Gradle dependencies. The iOS adapter uses only Foundation and does not require CocoaPods. The Windows adapter uses the system WinHTTP library and does not require bundled DLLs.
 
 Desktop macOS builds link against libcurl. A minimal local shim is used when `curl/curl.h` is not available in the native-extension build environment. Linux builds use Defold's built-in connection pool and SSL socket APIs for `http://` and `https://` SSE endpoints, so Defold Extender does not need packaged libcurl/OpenSSL libraries.
 
