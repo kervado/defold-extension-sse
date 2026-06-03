@@ -24,14 +24,12 @@ platforms:
     arm64-linux:
         context:
             flags: ["-std=c++11"]
-            defines: ["SSE_USE_LIBCURL"]
-            libs: ["curl", "ssl", "crypto", "z"]
+            defines: ["SSE_USE_POSIX_HTTP"]
 
     x86_64-linux:
         context:
             flags: ["-std=c++11"]
-            defines: ["SSE_USE_LIBCURL"]
-            libs: ["curl", "ssl", "crypto", "z"]
+            defines: ["SSE_USE_POSIX_HTTP"]
 
     x86-win32:
         context:

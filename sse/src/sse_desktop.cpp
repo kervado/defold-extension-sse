@@ -467,6 +467,10 @@ bool SSE_Platform_IsConnected(SSEConnection* connection)
     return desktop && desktop->m_Opened != 0 && !SSEDesktop_ShouldStop(desktop);
 }
 
+#elif defined(SSE_USE_POSIX_HTTP)
+
+#include "sse_posix_impl.h"
+
 #elif defined(SSE_USE_WINHTTP)
 
 struct SSEDesktopConnection
