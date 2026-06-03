@@ -5,49 +5,54 @@ platforms:
     common:
         context:
             includes: ["upload/sse/include"]
-            flags: ["-std=c++11"]
             defines: ["SSE_QUEUE_CAPACITY=1024"]
 
     arm64-osx:
         context:
+            flags: ["-std=c++11"]
             defines: ["SSE_USE_LIBCURL"]
             frameworks: ["CoreFoundation", "Foundation", "Security", "SystemConfiguration"]
             libs: ["curl", "z"]
 
     x86_64-osx:
         context:
+            flags: ["-std=c++11"]
             defines: ["SSE_USE_LIBCURL"]
             frameworks: ["CoreFoundation", "Foundation", "Security", "SystemConfiguration"]
             libs: ["curl", "z"]
 
     arm64-linux:
         context:
+            flags: ["-std=c++11"]
             defines: ["SSE_USE_LIBCURL"]
             libs: ["curl", "ssl", "crypto", "z"]
 
     x86_64-linux:
         context:
+            flags: ["-std=c++11"]
             defines: ["SSE_USE_LIBCURL"]
             libs: ["curl", "ssl", "crypto", "z"]
 
     x86-win32:
         context:
+            flags: ["-std=c++17"]
             defines: ["SSE_USE_WINHTTP"]
             libs: ["winhttp"]
 
     x86_64-win32:
         context:
+            flags: ["-std=c++17"]
             defines: ["SSE_USE_WINHTTP"]
             libs: ["winhttp"]
 
     arm64-ios:
         context:
-            flags: ["-fblocks"]
+            flags: ["-std=c++11", "-fblocks"]
             frameworks: ["Foundation"]
             linkFlags: ["-ObjC"]
 
     x86_64-ios:
         context:
-            flags: ["-fblocks"]
+            flags: ["-std=c++11", "-fblocks"]
             frameworks: ["Foundation"]
             linkFlags: ["-ObjC"]
