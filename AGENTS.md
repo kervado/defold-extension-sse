@@ -2,6 +2,6 @@
 
 ## Shared agent skills
 
-When a task calls for a skill, consider both repository-local skills and the [Kervado skill catalog](https://github.com/kervado/agent-skills/tree/main/plugins/kervado-gamedev/skills). The shared catalog follows `main`.
+Resolve a requested skill by its short name. Check repository-local skills and the shared [Kervado catalog](https://github.com/kervado/agent-skills) under `plugins/kervado-gamedev/skills/`. For a named skill, look for `<name>/SKILL.md`. For a task without a skill name, match the available names and descriptions. The catalog directory is the index for current and future skills.
 
-Use the named skill when requested. Otherwise, match the task against skill names and descriptions. For shared skills, resolve the current `kervado/agent-skills@main` commit with authenticated GitHub access. Use an installed copy at that revision, or list `plugins/kervado-gamedev/skills/` there and read the selected `SKILL.md` and its referenced files from that commit. Apply it in this repository. Shared skills stay in the catalog. If access is unavailable, say so when the task depends on a shared skill.
+Use the catalog's `main` branch by default, independently of this repository's branch. If the user explicitly requests a different catalog branch, use it for this task. Resolve the chosen branch to its current commit with authenticated GitHub access. Read the selected skill and its referenced files from that same commit, directly on GitHub or from a matching local checkout. If the requested revision or skill cannot be read, report that instead of silently switching revisions. Apply the instructions in the target repository.
